@@ -2,6 +2,8 @@
 
 A group chat between you, Claude Code and Codex, for working through ideas together.
 
+![Both AIs answer the same question side by side; Codex's idea is then forwarded to Claude, who combines the two](docs/screenshot.png)
+
 ```bash
 python3 server.py --open        # http://127.0.0.1:8765
 ```
@@ -47,3 +49,7 @@ Chats are saved as JSON in `data/chats/`, including the prompt each AI was sent 
 | `MULTICHAT_DATA` | Where chats and per-chat workspaces are stored (default `./data`) |
 
 If the `codex` command on your PATH is broken, the server falls back to the native binary inside the npm package. The npm `codex` command is a Node wrapper, so a broken Node install breaks it.
+
+## License
+
+[MIT](LICENSE)

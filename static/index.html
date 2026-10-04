@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>multi-chat</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="side-head">
+      <span class="brand">multi&#8209;chat</span>
+      <button id="new-chat" class="btn primary small">+ New</button>
+    </div>
+    <ul id="chat-list"></ul>
+  </aside>
+
+  <main id="main">
+    <header id="header" hidden>
+      <button id="toggle-side" class="icon" title="Chats">☰</button>
+      <input id="title" spellcheck="false">
+      <div id="statuses"></div>
+      <div id="share" class="seg small" role="radiogroup" aria-label="What the AIs see of each other">
+        <button type="button" data-share="manual" title="Each AI sees your messages but not the other's replies, unless you forward, debate or synthesize">Independent</button>
+        <button type="button" data-share="auto" title="Group chat: each turn, both AIs catch up on everything, including each other's replies">Shared</button>
+      </div>
+      <div class="tools">
+        <div class="pop-wrap">
+          <button class="btn" data-pop="debate-pop">Debate</button>
+          <div id="debate-pop" class="pop wide" hidden>
+            <label class="stack">Topic <span class="hint">(optional)</span>
+              <textarea id="debate-topic" rows="3" placeholder="What should they debate? Leave empty to have the first speaker respond to the other's latest reply."></textarea>
+            </label>
+            <label>Rounds <input id="debate-rounds" type="number" min="1" max="10" value="2"></label>
+            <label>Who starts
+              <select id="debate-first"><option value="claude">Claude</option><option value="codex">Codex</option></select>
+            </label>
+            <p id="debate-summary" class="summary"></p>
+            <p class="hint">Before the debate, each AI catches up on the other's replies it hasn't seen.</p>
+            <button id="debate-go" class="btn primary">Start debate</button>
+          </div>
+        </div>
+        <div class="pop-wrap">
+          <button class="btn" data-pop="synth-pop">Synthesize</button>
+          <div id="synth-pop" class="pop" hidden>
+            <p class="hint">One AI summarizes the whole thread: agreements, disagreements, open questions, next step.</p>
+            <button class="btn" data-synth="claude">by Claude</button>
+            <button class="btn" data-synth="codex">by Codex</button>
+          </div>
+        </div>
+        <button id="stop" class="btn danger" disabled>Stop</button>
+        <button id="open-settings" class="icon" title="Chat settings">⚙</button>
+      </div>
+    </header>
+
+    <section id="thread"></section>
+
+    <div id="empty" class="empty">
+      <h1>You, Claude &amp; Codex</h1>
+      <p>Ask both at once, forward one's reply to the other, let them debate, or have one synthesize.</p>
+      <button id="empty-new" class="btn primary">Start a chat</button>
+      <p id="bins" class="hint"></p>
+    </div>
+
+    <form id="composer" hidden>
+      <div id="fwd-banner" hidden>
+        <span id="fwd-text"></span>
+        <button type="button" id="fwd-cancel" class="icon" title="Cancel forward">✕</button>
+      </div>
+      <div class="compose-row">
+        <div id="targets" class="seg" role="radiogroup" aria-label="Send to">
+          <button type="button" data-t="both" class="on">Both</button>
+          <button type="button" data-t="claude">Claude</button>
+          <button type="button" data-t="codex">Codex</button>
+        </div>
+        <textarea id="input" rows="1" placeholder="Message both…  (@claude / @codex to address one)"></textarea>
+        <button id="send" class="btn primary" type="submit">Send</button>
+      </div>
+    </form>
+  </main>
+
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <h2>Chat settings</h2>
+
+      <fieldset>
+        <legend>What the AIs see of each other</legend>
+        <label class="radio"><input type="radio" name="share" value="manual">
+          <span><b>Independent</b> — they only see each other's replies when you forward, debate or synthesize. Best for getting unbiased second opinions.</span></label>
+        <label class="radio"><input type="radio" name="share" value="auto">
+          <span><b>Group chat</b> — every turn, each catches up on everything said since its last turn, including the other AI.</span></label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Tools</legend>
+        <label class="radio"><input type="radio" name="tools" value="none"><span><b>Talk only</b> (Codex still gets a read-only sandbox)</span></label>
+        <label class="radio"><input type="radio" name="tools" value="read"><span><b>Read-only</b> — can read files in the working dir and search the web</span></label>
+        <label class="radio"><input type="radio" name="tools" value="write"><span><b>Can edit</b> files in the working dir</span></label>
+      </fieldset>
+
+      <label class="field">Working directory
+        <input name="workdir" spellcheck="false">
+        <small class="hint" id="workdir-hint">Point this at a project to give them context. Locked after the first reply.</small>
+      </label>
+
+      <div class="agent-cols">
+        <fieldset data-agent="claude">
+          <legend>Claude</legend>
+          <label class="field">Model
+            <select name="model"></select>
+            <input name="model-custom" placeholder="model id, e.g. claude-opus-5-5" spellcheck="false" hidden>
+            <small class="hint model-desc"></small>
+          </label>
+          <label class="field">Effort <select name="effort"></select></label>
+          <label class="field">Role / persona <textarea name="persona" rows="3" placeholder="e.g. the skeptic: stress-test every idea"></textarea></label>
+        </fieldset>
+        <fieldset data-agent="codex">
+          <legend>Codex</legend>
+          <label class="field">Model
+            <select name="model"></select>
+            <input name="model-custom" placeholder="model id" spellcheck="false" hidden>
+            <small class="hint model-desc"></small>
+          </label>
+          <label class="field">Effort <select name="effort"></select></label>
+          <label class="field">Role / persona <textarea name="persona" rows="3" placeholder="e.g. the builder: turn ideas into concrete plans"></textarea></label>
+        </fieldset>
+      </div>
+
+      <div class="dialog-actions">
+        <button value="delete" class="btn danger subtle" id="delete-chat" type="button">Delete chat</button>
+        <span class="spacer"></span>
+        <button value="cancel" class="btn" formnovalidate>Cancel</button>
+        <button value="save" class="btn primary" id="save-settings">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="prompt-view">
+    <div class="prompt-wrap">
+      <div class="prompt-head">
+        <h2 id="prompt-title">What was sent</h2>
+        <button id="prompt-close" class="icon" title="Close">✕</button>
+      </div>
+      <p class="hint">Command</p>
+      <pre id="prompt-cmd"></pre>
+      <p class="hint">Prompt (sent on stdin; the AI's session also remembers everything it received before)</p>
+      <pre id="prompt-text"></pre>
+    </div>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

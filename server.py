@@ -641,9 +641,12 @@ class App:
                 cmd += ["--model", a["model"]]
             if a["effort"]:
                 cmd += ["--effort", a["effort"]]
+            # --tools only limits which tools exist; in dontAsk mode each one must also be pre-approved
+            # with --allowedTools, or every call is refused (there's nobody to click "allow").
+            read_only = "Read,Grep,Glob,WebSearch,WebFetch"
             cmd += {"none": ["--tools", ""],
-                    "read": ["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--permission-mode", "dontAsk"],
-                    "write": ["--permission-mode", "acceptEdits"]}[s["tools"]]
+                    "read": ["--tools", read_only, "--allowedTools", read_only, "--permission-mode", "dontAsk"],
+                    "write": ["--allowedTools", read_only, "--permission-mode", "acceptEdits"]}[s["tools"]]
             return cmd
         cmd = [self.bins["codex"], "exec", "--json", "--skip-git-repo-check",
                "-s", "workspace-write" if s["tools"] == "write" else "read-only"]

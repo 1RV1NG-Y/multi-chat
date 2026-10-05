@@ -10,6 +10,14 @@ python3 server.py --open        # http://127.0.0.1:8765
 
 It needs only Python 3.11 or newer, with no packages to install. It drives the `claude` and `codex` CLIs you're already logged into, so it uses your existing subscriptions.
 
+### App menu launcher (Linux)
+
+```bash
+./launch.py --install
+```
+
+This adds **multi-chat** to your desktop's app menu (GNOME, KDE, and others). Opening it starts the server in the background if it isn't already running, then opens the chat in its own window. With a Chromium-based default browser (Brave, Chrome, Vivaldi, …) that's an app window with no tabs or address bar; other browsers get a normal window. The browser starts with the same command as its own menu entry, so your extensions and profile flags still apply. Right-click the icon for **Stop server**. The server's log is in `~/.local/state/multi-chat/server.log`. Use `./launch.py --uninstall` to remove the menu entry.
+
 ## What you can do
 
 - **Send** a message to both AIs, or to just one using the target switch or by typing `@claude` / `@codex` in the message. When both reply, their answers show side by side.

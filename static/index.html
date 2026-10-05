@@ -70,7 +70,10 @@
         <span id="fwd-text"></span>
         <button type="button" id="fwd-cancel" class="icon" title="Cancel forward">✕</button>
       </div>
+      <div id="pending-files" hidden></div>
       <div class="compose-row">
+        <button type="button" id="attach" class="icon attach" title="Attach files (or drag & drop, or paste)">📎</button>
+        <input type="file" id="file-input" multiple hidden>
         <div id="targets" class="seg" role="radiogroup" aria-label="Send to">
           <button type="button" data-t="both" class="on">Both</button>
           <button type="button" data-t="claude">Claude</button>
@@ -138,6 +141,8 @@
     </form>
   </dialog>
 
+  <div id="drop-overlay" hidden><div>Drop files to attach</div></div>
+
   <dialog id="prompt-view">
     <div class="prompt-wrap">
       <div class="prompt-head">
@@ -146,6 +151,7 @@
       </div>
       <p class="hint">Command</p>
       <pre id="prompt-cmd"></pre>
+      <p class="hint" id="prompt-native" hidden></p>
       <p class="hint">Prompt (sent on stdin; the AI's session also remembers everything it received before)</p>
       <pre id="prompt-text"></pre>
     </div>

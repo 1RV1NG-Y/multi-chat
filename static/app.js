@@ -12,6 +12,7 @@ const state = {
   es: null,
   target: "both",
   forward: null, // { id, from, to }
+  uploads: [], // files added to the composer: { key, file, url, att (server meta, once uploaded), error }
 };
 
 // ---------------------------------------------------------------- api
@@ -76,6 +77,8 @@ async function newChat() {
 function openChat(id) {
   if (state.es) state.es.close();
   state.forward = null;
+  if (state.chat) for (const up of [...state.uploads]) removeUpload(up); // unsent files of the chat we're leaving
+  clearUploads();
   location.hash = id;
   const es = new EventSource(`/api/chats/${id}/events`);
   es.onmessage = (e) => onEvent(JSON.parse(e.data));
@@ -276,6 +279,7 @@ function buildMessage(m) {
     if (m.status === "streaming") body.lastElementChild?.classList.add("cursor");
   }
   el.append(body);
+  if (m.attachments?.length) el.append(attachmentsBlock(m));
 
   if ((m.status === "pending" || m.status === "streaming") && !m.text) {
     el.append(typing(m.author));
@@ -356,11 +360,16 @@ async function showPrompt(m) {
   const dlg = $("#prompt-view");
   $("#prompt-title").textContent = `What ${NAME[m.author]} was sent`;
   $("#prompt-cmd").textContent = "";
+  $("#prompt-native").hidden = true;
   $("#prompt-text").textContent = "Loading…";
   dlg.showModal();
   try {
     const sent = await api("GET", `/api/chats/${state.chat.id}/messages/${m.id}/prompt`);
     $("#prompt-cmd").textContent = sent.command.map((a) => (/[\s"']/.test(a) || a === "" ? JSON.stringify(a) : a)).join(" ");
+    if (sent.native?.length) {
+      $("#prompt-native").hidden = false;
+      $("#prompt-native").textContent = `Also attached directly (as images/PDFs, not text): ${sent.native.join(", ")}`;
+    }
     $("#prompt-text").textContent = sent.prompt;
   } catch (err) {
     $("#prompt-text").textContent = err.message;
@@ -410,12 +419,128 @@ function findMsg(id) {
   return state.chat?.messages.find((m) => m.id === id);
 }
 
+// ---------------------------------------------------------------- attachments
+
+const KIND_ICON = { image: "🖼", pdf: "📄", docx: "📝", text: "📃", other: "📦" };
+
+function attUrl(id) {
+  return `/api/chats/${state.chat.id}/attachments/${id}`;
+}
+
+function fmtSize(n) {
+  return n < 1024 ? `${n} B` : n < 2 ** 20 ? `${Math.round(n / 1024)} KB` : `${(n / 2 ** 20).toFixed(1)} MB`;
+}
+
+function addFiles(files) {
+  if (!state.chat || state.forward) return;
+  for (let file of files) {
+    if (file.name === "image.png" || !file.name) {
+      // Pasted screenshots all arrive as "image.png"; give them distinguishable names.
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+      file = new File([file], `pasted-${stamp}.${(file.type.split("/")[1] || "png").replace("jpeg", "jpg")}`, { type: file.type });
+    }
+    const up = { key: Math.random().toString(36).slice(2), file, url: file.type.startsWith("image/") ? URL.createObjectURL(file) : null };
+    state.uploads.push(up);
+    fetch(`/api/chats/${state.chat.id}/attachments`, {
+      method: "POST",
+      headers: { "Content-Type": file.type || "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
+      body: file,
+    })
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || r.statusText);
+        up.att = data;
+        (state.chat.attachments ||= {})[data.id] = data;
+      })
+      .catch((err) => (up.error = err.message))
+      .finally(renderUploads);
+  }
+  renderUploads();
+}
+
+function removeUpload(up) {
+  state.uploads = state.uploads.filter((u) => u !== up);
+  if (up.url) URL.revokeObjectURL(up.url);
+  if (up.att) {
+    delete state.chat.attachments?.[up.att.id];
+    api("DELETE", `/api/chats/${state.chat.id}/attachments/${up.att.id}`).catch(() => {});
+  }
+  renderUploads();
+}
+
+function clearUploads() {
+  for (const up of state.uploads) if (up.url) URL.revokeObjectURL(up.url);
+  state.uploads = [];
+  renderUploads();
+}
+
+function renderUploads() {
+  const box = $("#pending-files");
+  box.hidden = !state.uploads.length;
+  box.innerHTML = "";
+  for (const up of state.uploads) {
+    const chip = document.createElement("div");
+    chip.className = `file-chip${up.error ? " failed" : up.att ? "" : " uploading"}`;
+    if (up.url) {
+      const img = document.createElement("img");
+      img.src = up.url;
+      img.alt = "";
+      chip.append(img);
+    } else {
+      const icon = document.createElement("span");
+      icon.className = "file-icon";
+      icon.textContent = KIND_ICON[up.att?.kind] || "📄";
+      chip.append(icon);
+    }
+    const label = document.createElement("span");
+    label.className = "file-label";
+    label.textContent = up.file.name;
+    const meta = document.createElement("small");
+    meta.textContent = up.error ? up.error : up.att ? fmtSize(up.file.size) : "uploading…";
+    label.append(meta);
+    chip.append(label, button("✕", "file-remove", () => removeUpload(up), "Remove"));
+    box.append(chip);
+  }
+}
+
+function attachmentsBlock(m) {
+  const box = document.createElement("div");
+  box.className = "atts";
+  for (const id of m.attachments) {
+    const att = state.chat.attachments?.[id];
+    if (!att) continue;
+    const a = document.createElement("a");
+    a.href = attUrl(id);
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.title = `${att.name} · ${fmtSize(att.size)}`;
+    if (att.kind === "image") {
+      a.className = "att-image";
+      const img = document.createElement("img");
+      img.src = a.href;
+      img.alt = att.name;
+      img.loading = "lazy";
+      a.append(img);
+    } else {
+      a.className = "att-file";
+      a.textContent = `${KIND_ICON[att.kind] || "📄"} ${att.name}`;
+      const s = document.createElement("small");
+      s.textContent = fmtSize(att.size);
+      a.append(s);
+    }
+    box.append(a);
+  }
+  return box;
+}
+
 // ---------------------------------------------------------------- composer
 
 function renderComposer() {
   const f = state.forward;
   $("#fwd-banner").hidden = !f;
   $("#targets").classList.toggle("disabled", !!f);
+  $("#attach").disabled = !!f;
+  $("#pending-files").classList.toggle("disabled", !!f);
   for (const b of $$("#targets button")) b.classList.toggle("on", b.dataset.t === state.target);
   if (f) {
     $("#fwd-banner").className = `to-${f.to}`;
@@ -452,9 +577,12 @@ async function submit(e) {
       state.forward = null;
       renderComposer();
     } else {
-      if (!text.trim()) return;
+      if (state.uploads.some((u) => !u.att && !u.error)) return toast(new Error("Files are still uploading."));
+      const attachments = state.uploads.filter((u) => u.att).map((u) => u.att.id);
+      if (!text.trim() && !attachments.length) return;
       const to = state.target === "both" ? ["claude", "codex"] : [state.target];
-      await api("POST", `/api/chats/${cid}/send`, { text, to });
+      await api("POST", `/api/chats/${cid}/send`, { text, to, attachments });
+      clearUploads();
     }
     input.value = "";
     autosize();
@@ -629,6 +757,41 @@ function init() {
       .catch(toast);
   };
   for (const b of $$("#share button")) b.onclick = () => setShare(b.dataset.share);
+
+  // Attachments: paperclip, paste (e.g. screenshots), drag & drop anywhere on the page.
+  $("#attach").onclick = () => $("#file-input").click();
+  $("#file-input").onchange = (e) => {
+    addFiles([...e.target.files]);
+    e.target.value = "";
+  };
+  input.addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.files || [])];
+    if (files.length) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  });
+  let dragDepth = 0;
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+  document.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e) || !state.chat || state.forward) return;
+    dragDepth++;
+    $("#drop-overlay").hidden = false;
+  });
+  document.addEventListener("dragleave", (e) => {
+    if (hasFiles(e) && --dragDepth <= 0) {
+      dragDepth = 0;
+      $("#drop-overlay").hidden = true;
+    }
+  });
+  document.addEventListener("dragover", (e) => hasFiles(e) && e.preventDefault());
+  document.addEventListener("drop", (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    $("#drop-overlay").hidden = true;
+    addFiles([...e.dataTransfer.files]);
+  });
   $("#prompt-close").onclick = () => $("#prompt-view").close();
   for (const b of $$("[data-synth]")) {
     b.onclick = () => {

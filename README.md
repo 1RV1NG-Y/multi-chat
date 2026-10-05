@@ -25,6 +25,16 @@ This adds **multi-chat** to your desktop's app menu (GNOME, KDE, and others). Op
 - **Debate**: they reply to each other for N rounds while you watch ("2 rounds · 4 replies · Claude starts"). Give it a topic and the first speaker opens on it. Without one, the first speaker responds to the other's latest reply. Before the debate, each AI catches up on the other's replies it hasn't seen. Each turn knows where it falls, and the final speaker closes with agreements, disagreements and a recommendation.
 - **Synthesize**: one AI sums up the whole thread: where they agree, where they disagree, open questions and a next step.
 - **Stop** kills whatever is running and keeps any partial reply. **Retry** reruns a failed or stopped reply with the same request. For a debate turn, the debate then continues.
+- **Attach files**: click 📎, drag files onto the window, or paste (screenshots included). Images and PDFs go to the AIs natively, and documents are read as text:
+
+  | File type | Claude | Codex |
+  |---|---|---|
+  | Images (PNG, JPEG, GIF, WebP) | sent with the message (vision) | `--image` (vision) |
+  | PDF | sent with the message (text and visuals) | text extracted with `pdftotext`, if installed |
+  | Text, code, Markdown, CSV, JSON, `.docx` | contents included in the prompt | same |
+  | Anything else | file path, read with its tools if allowed | same |
+
+  Files are stored in `data/attachments/<chat>/`, up to 50 MB each.
 - **What was sent**: every AI reply has a button that shows the exact command and prompt that AI received for that turn.
 - **Seen by**: each reply shows whether the other AI has received it ("seen by Codex" / "not shared with Codex").
 

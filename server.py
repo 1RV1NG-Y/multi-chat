@@ -8,8 +8,11 @@ shown and, on every turn, sends it only what's new, labelled by author.
 Standard library only:  python3 server.py [--port 8765] [--open]
 """
 import argparse
+import base64
 import glob
+import html
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -21,9 +24,10 @@ import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote as urllib_quote, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -147,6 +151,66 @@ def models():
                    if m.get("slug") and "/" not in m["slug"] and m.get("visibility", "list") == "list"],
     }
     return {"claude": claude, "codex": codex}
+
+
+# --------------------------------------------------------------------------- attachments
+#
+# images     Claude: image block in the message; Codex: --image
+# pdf        Claude: document block (text and visuals); Codex: text extracted with pdftotext
+# text/docx  contents included in the prompt for both
+# other      both get the file path and can read it with their tools, if allowed
+
+MAX_UPLOAD = 50 * 2**20
+MAX_INLINE_CHARS = 150_000
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+CLAUDE_MAX_IMAGE = 5 * 2**20 * 3 // 4      # the 5 MB limit applies to the base64 size
+CLAUDE_MAX_PDF = 32 * 2**20
+TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".xml",
+                   ".html", ".htm", ".css", ".js", ".ts", ".tsx", ".jsx", ".py", ".rb", ".go", ".rs", ".java", ".kt",
+                   ".c", ".h", ".cpp", ".hpp", ".cs", ".swift", ".php", ".sh", ".bash", ".fish", ".zsh", ".sql",
+                   ".ini", ".cfg", ".conf", ".log", ".svg", ".tex", ".rst", ".org"}
+
+
+def attachment_kind(name, mime):
+    ext = Path(name).suffix.lower()
+    if mime in IMAGE_TYPES or (mime.startswith("image/") and ext != ".svg"):
+        return "image"
+    if ext == ".pdf" or mime == "application/pdf":
+        return "pdf"
+    if ext == ".docx":
+        return "docx"
+    if ext in TEXT_EXTENSIONS or mime.startswith("text/"):
+        return "text"
+    return "other"
+
+
+def extract_text(att):
+    """Plain text of a text/docx/pdf attachment for inlining into a prompt, or None if unavailable."""
+    path, kind = Path(att["file"]), att["kind"]
+    try:
+        if kind == "text":
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        elif kind == "docx":
+            with zipfile.ZipFile(path) as z:
+                xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+            xml = re.sub(r"</w:p>", "\n", xml)
+            xml = re.sub(r"<w:tab/>", "\t", xml)
+            text = html.unescape(re.sub(r"<[^>]+>", "", xml))
+        elif kind == "pdf" and shutil.which("pdftotext"):
+            out = subprocess.run(["pdftotext", "-layout", str(path), "-"], capture_output=True, timeout=60)
+            text = out.stdout.decode("utf-8", errors="replace") if out.returncode == 0 else None
+        else:
+            return None
+    except (OSError, zipfile.BadZipFile, KeyError, subprocess.SubprocessError):
+        return None
+    if text is not None and len(text) > MAX_INLINE_CHARS:
+        text = text[:MAX_INLINE_CHARS] + f"\n\n[... truncated: showing the first {MAX_INLINE_CHARS:,} characters]"
+    return text
+
+
+def safe_filename(name):
+    name = Path(name or "file").name.strip() or "file"
+    return re.sub(r"[^\w.\- ()]+", "_", name)[:120]
 
 
 def mentions(text):
@@ -334,23 +398,69 @@ class App:
         self.stop(cid)
         with self.lock:
             self.store.delete(cid)
+            shutil.rmtree(self.attachment_dir(cid), ignore_errors=True)
+
+    # ---- attachments
+
+    def attachment_dir(self, cid):
+        return self.store.root / "attachments" / cid
+
+    def upload(self, cid, name, mime, data):
+        if len(data) > MAX_UPLOAD:
+            raise ValueError(f"Files can be at most {MAX_UPLOAD // 2**20} MB.")
+        name = safe_filename(name)
+        mime = (mime or "").split(";")[0].strip().lower()
+        if not mime or mime in ("application/octet-stream", "application/x-www-form-urlencoded"):
+            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        aid = new_id()
+        with self.lock:
+            chat = self.chat(cid)
+            folder = self.attachment_dir(cid)
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{aid}-{name}"
+            path.write_bytes(data)
+            att = {"id": aid, "name": name, "mime": mime, "size": len(data), "kind": attachment_kind(name, mime),
+                   "file": str(path), "sent": False}
+            chat.setdefault("attachments", {})[aid] = att
+            self.store.save(chat)
+        return att
+
+    def delete_upload(self, cid, aid):
+        with self.lock:
+            chat = self.chat(cid)
+            att = chat.get("attachments", {})[aid]
+            if att["sent"]:
+                raise ValueError("That file is already part of a sent message.")
+            Path(att["file"]).unlink(missing_ok=True)
+            del chat["attachments"][aid]
+            self.store.save(chat)
+
+    def attachment(self, cid, aid):
+        with self.lock:
+            return self.chat(cid).get("attachments", {})[aid]
 
     # ---- actions
 
-    def send(self, cid, text, to=None):
+    def send(self, cid, text, to=None, attachments=()):
         text = text.strip()
-        if not text:
-            raise ValueError("Empty message.")
         targets = mentions(text) or [a for a in (to or AGENTS) if a in AGENTS]
         if not targets:
             raise ValueError("No recipients.")
         stop = self.stop_event(cid)
         with self.lock:
             chat = self.chat(cid)
+            files = [chat.get("attachments", {}).get(aid) for aid in attachments or ()]
+            if None in files:
+                raise ValueError("An attachment is missing; try adding it again.")
+            if not text and not files:
+                raise ValueError("Empty message.")
+            for f in files:
+                f["sent"] = True
             if chat["title"] == "New chat":
-                chat["title"] = text.splitlines()[0][:60]
+                chat["title"] = (text.splitlines()[0] if text else ", ".join(f["name"] for f in files))[:60]
                 self.hub.publish(cid, {"type": "chat", "chat": self.meta(chat)})
-            self.add_message(chat, "user", text, to=targets)
+            extra = {"attachments": [f["id"] for f in files]} if files else {}
+            self.add_message(chat, "user", text, to=targets, **extra)
             group = new_id() if len(targets) > 1 else None
             jobs = [(a, self.add_message(chat, a, status="pending", group=group)) for a in targets]
             self.store.save(chat)
@@ -493,19 +603,24 @@ class App:
                 if prev:
                     # Resend what the failed attempt was sent; a partial run may already have marked it as seen.
                     original, delivered, sent = prev["original"], prev["delivered"], prev["sent"]
+                    file_ids = prev.get("files", [])
                     prompt = ("(Retry: your previous attempt at this reply was interrupted or failed, so here is "
                               "the same request again. Answer it in full.)\n\n" + original)
                 else:
-                    prompt, delivered, sent = self.build_prompt(chat, agent, action)
+                    prompt, delivered, sent, file_ids = self.build_prompt(chat, agent, action)
                     original = prompt
-                cmd = self.command(chat, agent)
+                files = [a for a in (chat.get("attachments", {}).get(i) for i in file_ids) if a]
+                cmd = self.command(chat, agent, files)
+                native = [a["name"] for a in files if self.native(agent, a)]
                 prompts[msg["id"]] = {"prompt": prompt, "original": original, "delivered": delivered, "sent": sent,
+                                      "files": file_ids, "native": native,
                                       "command": [os.path.basename(cmd[0])] + cmd[1:], "ts": now()}
                 msg.update(status="streaming", action={k: v for k, v in action.items() if k != "retry"})
                 self.push(chat, msg)
             self.set_status(cid, agent, "running", "starting…")
             try:
-                session, error, warnings = self.run_cli(chat, agent, cmd, prompt, msg, stop)
+                payload = self.payload(agent, prompt, files)
+                session, error, warnings = self.run_cli(chat, agent, cmd, payload, msg, stop)
             except Exception as e:  # noqa: BLE001 — surface anything to the UI
                 session, error, warnings = None, f"{type(e).__name__}: {e}", []
             with self.lock:
@@ -560,7 +675,12 @@ class App:
             parts.append(f"Your role in this discussion: {persona}" if persona
                          else "Your previously assigned role no longer applies; just be yourself.")
         if pending:
-            parts.append("New in the conversation since your last turn:\n\n" + "\n\n".join(self.fmt(m) for m in pending))
+            parts.append("New in the conversation since your last turn:\n\n"
+                         + "\n\n".join(self.fmt(m, chat) for m in pending))
+        file_ids = [i for m in pending if m["author"] == "user" for i in m.get("attachments", [])]
+        files = [a for a in (chat.get("attachments", {}).get(i) for i in file_ids) if a]
+        if files:
+            parts.append(self.attachment_section(agent, files))
 
         kind = action["kind"]
         if kind == "forward":
@@ -599,7 +719,52 @@ class App:
             parts.append("(No new messages — continue the discussion.)")
 
         delivered = [m["id"] for m in pending] + sorted(explicit)
-        return "\n\n---\n\n".join(parts), delivered, {"persona_sent": persona, "mode_sent": mode}
+        return "\n\n---\n\n".join(parts), delivered, {"persona_sent": persona, "mode_sent": mode}, file_ids
+
+    @staticmethod
+    def native(agent, att):
+        """Whether this agent's CLI takes the file directly (vision / PDF input) rather than as text or a path."""
+        if att["kind"] == "image" and att["mime"] not in IMAGE_TYPES:
+            return False  # e.g. HEIC, TIFF: neither CLI takes these; they get the file path instead
+        if agent == "claude":
+            return ((att["kind"] == "image" and att["size"] <= CLAUDE_MAX_IMAGE)
+                    or (att["kind"] == "pdf" and att["size"] <= CLAUDE_MAX_PDF))
+        return att["kind"] == "image"
+
+    def attachment_section(self, agent, files):
+        parts = ["Files the User attached:"]
+        for att in files:
+            if self.native(agent, att):
+                parts.append(f"- {att['name']}: attached to this message as {'an image' if att['kind'] == 'image' else 'a PDF'} "
+                             f"(also saved at {att['file']}).")
+                continue
+            text = extract_text(att)
+            if text is not None:
+                note = ' note="text extracted from the PDF"' if att["kind"] == "pdf" else ""
+                parts.append(f'<file name="{att["name"]}" path="{att["file"]}"{note}>\n{text}\n</file>')
+            else:
+                parts.append(f"- {att['name']} ({att['mime']}, {att['size']:,} bytes): can't be shown inline. It's saved "
+                             f"at {att['file']}; open it with your tools if you can, or say you can't read it.")
+        return "\n\n".join(parts)
+
+    def payload(self, agent, prompt, files):
+        """What goes on the CLI's stdin. Claude takes a stream-json message so images and PDFs can ride along."""
+        if agent != "claude":
+            return prompt
+        content = [{"type": "text", "text": prompt}]
+        for att in files:
+            if not self.native(agent, att):
+                continue
+            try:
+                data = base64.b64encode(Path(att["file"]).read_bytes()).decode()
+            except OSError:
+                continue
+            if att["kind"] == "image":
+                content.append({"type": "image", "source": {"type": "base64", "media_type": att["mime"], "data": data}})
+            else:
+                content.append({"type": "document", "title": att["name"],
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": data}})
+        return json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n"
 
     @staticmethod
     def debate_label(m):
@@ -608,7 +773,12 @@ class App:
         step, total = m["debate"].split("/")
         return f"debate turn {step} of {total}" + (", final" if step == total else "")
 
-    def fmt(self, m):
+    def fmt(self, m, chat):
+        line = self._fmt(m)
+        names = [chat.get("attachments", {}).get(i, {}).get("name", "?") for i in m.get("attachments", [])]
+        return line + (f"\n(attached: {', '.join(names)})" if names else "")
+
+    def _fmt(self, m):
         who = LABEL.get(m["author"], m["author"])
         if m["kind"] == "forward":
             to = ", ".join(LABEL[a] for a in m.get("to", []))
@@ -628,13 +798,15 @@ class App:
 
     # ---- CLI drivers
 
-    def command(self, chat, agent):
+    def command(self, chat, agent, files=()):
         s = chat["settings"]
         a = s["agents"][agent]
         session = chat["agents"][agent]["session"]
         if agent == "claude":
-            cmd = [self.bins["claude"], "-p", "--output-format", "stream-json", "--verbose",
-                   "--include-partial-messages"]
+            cmd = [self.bins["claude"], "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+                   "--verbose", "--include-partial-messages"]
+            if s["tools"] != "none" and chat.get("attachments"):
+                cmd += ["--add-dir", str(self.attachment_dir(chat["id"]))]  # so Read can open files sent by path
             if session:
                 cmd += ["--resume", session]
             if a["model"]:
@@ -654,11 +826,14 @@ class App:
             cmd += ["-m", a["model"]]
         if a["effort"]:
             cmd += ["-c", f'model_reasoning_effort="{a["effort"]}"']
+        # "--image=path", not "-i path": the flag takes several values and would swallow the "-" below.
+        cmd += [f"--image={f['file']}" for f in files if self.native(agent, f)]
         cmd += ["resume", session, "-"] if session else ["-"]
         return cmd
 
     def run_cli(self, chat, agent, cmd, prompt, msg, stop):
-        """Run one turn. Returns (session id, fatal error, non-fatal warnings)."""
+        """Run one turn, writing `prompt` (the stdin payload) to the CLI.
+        Returns (session id, fatal error, non-fatal warnings)."""
         cid = chat["id"]
         proc = subprocess.Popen(cmd, cwd=chat["workdir"], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -667,11 +842,16 @@ class App:
             self.procs[(cid, agent)] = proc
         errlines = []
         threading.Thread(target=lambda: errlines.extend(proc.stderr), daemon=True).start()
-        try:
-            proc.stdin.write(prompt)
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
+
+        def feed():
+            # In its own thread: a large payload (base64 images/PDFs) must not block us from reading stdout,
+            # or both processes can stall on full pipes.
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=feed, daemon=True).start()
 
         state = {"session": None, "error": None, "warnings": [], "last_push": 0.0}
 
@@ -779,6 +959,9 @@ ROUTES = [
     ("POST", r"/api/chats/(\w+)/stop", "stop"),
     ("POST", r"/api/chats/(\w+)/messages/(\w+)/retry", "retry"),
     ("GET", r"/api/chats/(\w+)/messages/(\w+)/prompt", "prompt"),
+    ("POST", r"/api/chats/(\w+)/attachments", "upload"),
+    ("GET", r"/api/chats/(\w+)/attachments/(\w+)", "attachment"),
+    ("DELETE", r"/api/chats/(\w+)/attachments/(\w+)", "delete_upload"),
 ]
 TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
 
@@ -870,7 +1053,31 @@ class Handler(BaseHTTPRequestHandler):
     def h_send(self, cid):
         b = self.body()
         self.app.chat(cid)
-        self.app.send(cid, b.get("text", ""), b.get("to"))
+        self.app.send(cid, b.get("text", ""), b.get("to"), b.get("attachments", []))
+        self.json({"ok": True})
+
+    def h_upload(self, cid):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > MAX_UPLOAD:
+            self.close_connection = True  # don't read a body we're rejecting
+            return self.json({"error": f"Files can be at most {MAX_UPLOAD // 2**20} MB."}, 413)
+        data = self.rfile.read(n)
+        name = unquote(self.headers.get("X-Filename") or "file")
+        self.json(self.app.upload(cid, name, self.headers.get("Content-Type"), data))
+
+    def h_attachment(self, cid, aid):
+        att = self.app.attachment(cid, aid)
+        raw = Path(att["file"]).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", att["mime"])
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib_quote(att['name'])}")
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def h_delete_upload(self, cid, aid):
+        self.app.delete_upload(cid, aid)
         self.json({"ok": True})
 
     def h_forward(self, cid):
@@ -893,7 +1100,7 @@ class Handler(BaseHTTPRequestHandler):
             sent = self.app.chat(cid).get("prompts", {}).get(mid)
         if not sent:
             return self.json({"error": "No prompt recorded for this message (it may predate this feature)."}, 404)
-        self.json({"prompt": sent["prompt"], "command": sent["command"]})
+        self.json({"prompt": sent["prompt"], "command": sent["command"], "native": sent.get("native", [])})
 
     def h_synthesize(self, cid):
         self.app.chat(cid)
